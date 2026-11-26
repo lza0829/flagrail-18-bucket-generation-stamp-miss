@@ -1,0 +1,19 @@
+{
+  "类型": "互斥场景",
+  "批次编号": "互斥-百分比转名单",
+  "分桶": [
+    {
+      "桶键": "mutex.pct2list-gray10",
+      "开关键": "mutex.pct2list",
+      "桶类型": "百分比",
+      "先归档": true,
+      "规则": { "percent": 10, "salt": "v1" }
+    },
+    {
+      "桶键": "mutex.pct2list-list",
+      "开关键": "mutex.pct2list",
+      "桶类型": "名单",
+      "规则": { "edges": ["edge-a", "edge-b"] }
+    }
+  ]
+}

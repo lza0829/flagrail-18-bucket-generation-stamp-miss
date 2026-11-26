@@ -1,0 +1,25 @@
+{
+  "类型": "互斥场景",
+  "批次编号": "互斥-名单转百分比",
+  "分桶": [
+    {
+      "桶键": "mutex.list2pct-gray10",
+      "开关键": "mutex.list2pct",
+      "桶类型": "百分比",
+      "先归档": true,
+      "规则": { "percent": 10, "salt": "v1" }
+    },
+    {
+      "桶键": "mutex.list2pct-list",
+      "开关键": "mutex.list2pct",
+      "桶类型": "名单",
+      "规则": { "edges": ["edge-a"] }
+    },
+    {
+      "桶键": "mutex.list2pct-gray20",
+      "开关键": "mutex.list2pct",
+      "桶类型": "百分比",
+      "规则": { "percent": 20, "salt": "v2" }
+    }
+  ]
+}
