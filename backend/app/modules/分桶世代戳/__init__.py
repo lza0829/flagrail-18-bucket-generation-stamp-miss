@@ -1,57 +1,327 @@
-启用 = True
+"""分桶世代戳：把「生效分桶世代戳」接到写规闸与下发选规闸。
+
+本站落地的唯一口径（架构二选一之甲，贯彻到底，不提供乙工单口径）：
+**以戳锁现行规为准——下发只能绑定戳内生效规集合；戳外/归档规一律拒绝，
+已下发不得绑定旧集合。**
+
+* 规写入成功必须同票落世代戳：写规/归档的「改分桶规 + 落世代戳」在同一
+  `BEGIN IMMEDIATE` 事务里，半截失败整体回滚——禁止规生效成功而世代戳空。
+* 戳面烙：开关键、生效规集合哈希、世代号（单调递增）、戳时；并附生效集合明细。
+* 下发选规必须按本架构消化该戳：桶属当前戳内生效集且集合哈希与戳一致才放行；
+  无戳、错戳（哈希被拧）、点到归档/戳外规一律 409，票不落——禁止无戳点到归档规。
+* 戳按开关键隔离：邻开关键的戳永不串用，选规只读本键戳。
+* 热更新后无工单再下发：旧集合（含已归档规）一律拒、不新增已下发；幂等重投
+  一张绑旧集合的票也按旧集合拒绝——两口径结局在此可区分。
+* 无工单实体：核证里「工单」恒为无；改绑新集合不需要、也不接受工单，
+  成功的下发永远绑当前戳，票面世代号随戳单调上升。
+"""
+
+import hashlib
+import json
+from datetime import datetime, timezone
+
+表名 = "分桶世代戳表"
+口径 = "戳锁现行规"
+口径说明 = (
+    "以戳锁现行规为准：下发只能绑定戳内生效规集合；戳外/归档规一律拒绝，"
+    "已下发不得绑定旧集合。无换世代工单实体，工单恒为无。"
+)
+归档集标记 = "归档集"
+生效集标记 = "生效集"
 
 
-def 表名() -> str:
-    return "分桶世代戳表"
+class 世代戳拒绝(ValueError):
+    """戳闸拒绝（无戳/错戳/点归档/串键）。调用方翻译成 409，票不落、版本态不动。"""
 
 
-def 查现场(conn, 键: str | None = None) -> dict:
-    rows = []
+class 戳写入失败(RuntimeError):
+    """同票落戳失败。必须让整笔写规事务回滚——禁止规生效成功而世代戳空。"""
+
+
+def 此刻() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _解析规则(文: str):
     try:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM 分桶世代戳表 ORDER BY 编号 DESC LIMIT 40"
-        )]
+        return json.loads(文)
     except Exception:
-        rows = []
-    if 键:
-        rows = [r for r in rows if 键 in str(r.values())]
+        return 文
+
+
+def 生效集快照(conn, 开关键: str) -> list:
+    """读该开关键当前全部生效规（不只互斥族——戳锁的是整个生效集），按桶键定序。"""
+    rows = conn.execute(
+        "SELECT 桶键, 开关键, 桶类型, 规则, 状态, 更新时, 世代 "
+        "FROM 分桶规 WHERE 开关键=? AND 状态='生效' ORDER BY 桶键",
+        (开关键,),
+    ).fetchall()
+    return [
+        {
+            "桶键": r["桶键"],
+            "开关键": r["开关键"],
+            "桶类型": r["桶类型"],
+            "规则": _解析规则(r["规则"]),
+            "状态": r["状态"],
+            "更新时": r["更新时"],
+            "规世代": r["世代"],
+        }
+        for r in rows
+    ]
+
+
+def 归档集快照(conn, 开关键: str) -> list:
+    rows = conn.execute(
+        "SELECT 桶键, 开关键, 桶类型, 规则, 状态, 更新时, 归档时, 归档因, 世代 "
+        "FROM 分桶规 WHERE 开关键=? AND 状态='已归档' ORDER BY 归档时 DESC, 桶键",
+        (开关键,),
+    ).fetchall()
+    return [
+        {
+            "桶键": r["桶键"],
+            "开关键": r["开关键"],
+            "桶类型": r["桶类型"],
+            "规则": _解析规则(r["规则"]),
+            "状态": r["状态"],
+            "更新时": r["更新时"],
+            "归档时": r["归档时"],
+            "归档因": r["归档因"],
+            "规世代": r["世代"],
+        }
+        for r in rows
+    ]
+
+
+def 集合哈希(生效集: list) -> str:
+    """生效规集合哈希：定序后对 桶键/桶类型/更新时/规世代 取 sha256。
+
+    同一生效集必得同值；热更新（接管/替换/归档）改动集合即换值，
+    使「错戳」（库集与戳面哈希不一致）能被选规闸与核证识别。
+    """
+    规范 = [
+        {
+            "桶键": r["桶键"],
+            "桶类型": r["桶类型"],
+            "更新时": r["更新时"],
+            "规世代": int(r.get("规世代") or 0),
+        }
+        for r in sorted(生效集, key=lambda x: x["桶键"])
+    ]
+    文 = json.dumps(规范, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(文.encode("utf-8")).hexdigest()
+
+
+def 取现行戳(conn, 开关键: str) -> dict | None:
+    row = conn.execute(
+        f"SELECT * FROM {表名} WHERE 开关键=? ORDER BY 世代号 DESC LIMIT 1",
+        (开关键,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def 落戳(conn, 开关键: str, 变更: str = "", 工单: str = "") -> dict:
+    """在调用方的写事务内同票落世代戳。规生效成功而本函数失败必须让整笔回滚。
+
+    世代号在本键历史最大值上 +1，严格单调；新戳哈希 = 当下生效集重算值。
+    甲口径无工单实体：传入工单一律拒绝，核证工单恒为无。
+    """
+    if 工单:
+        raise 戳写入失败("甲口径（戳锁现行规）无换世代工单实体，禁止持单改绑")
+    生效集 = 生效集快照(conn, 开关键)
+    哈希 = 集合哈希(生效集)
+    顶 = conn.execute(
+        f"SELECT COALESCE(MAX(世代号), 0) AS m FROM {表名} WHERE 开关键=?",
+        (开关键,),
+    ).fetchone()
+    新号 = int(顶["m"] or 0) + 1
+    时 = 此刻()
+    归档集 = 归档集快照(conn, 开关键)
+    载荷 = {
+        "口径": 口径,
+        "变更": 变更,
+        "生效集合": [r["桶键"] for r in 生效集],
+        "归档集合": [r["桶键"] for r in 归档集],
+    }
+    cur = conn.execute(
+        f"""INSERT INTO {表名}
+            (开关键, 世代号, 生效集合, 集合哈希, 戳时, 工单, 变更, 载荷, 时刻)
+            VALUES (?,?,?,?,?, '', ?, ?, ?)""",
+        (开关键, 新号, json.dumps(载荷["生效集合"], ensure_ascii=False), 哈希,
+         时, 变更, json.dumps(载荷, ensure_ascii=False), 时),
+    )
+    if cur.rowcount != 1:
+        raise 戳写入失败(f"世代戳落库行数异常:{开关键}")
+    # 同票回读：落戳后立刻在同一事务内核对，禁止「规生效而戳空/戳旧」
+    回 = 取现行戳(conn, 开关键)
+    if not 回 or int(回["世代号"]) != 新号 or 回["集合哈希"] != 哈希:
+        raise 戳写入失败(f"世代戳同票回读不符:{开关键}")
     return {
-        "证明": rows,
-        "闸口": "选规放行",
-        "接写": False,
-        "nn": "18",
-        "kind": "bucket-gen",
-        "valid": False,
+        "开关键": 开关键,
+        "世代号": 新号,
+        "生效集合": 载荷["生效集合"],
+        "归档集合": 载荷["归档集合"],
+        "集合哈希": 哈希,
+        "戳时": 时,
+        "工单": "",
+        "变更": 变更,
+        "valid": True,
     }
 
 
-def 选规放行(conn, 键: str = "") -> bool:
-    return True
+def 选规闸(conn, 开关键: str, 桶键: str) -> dict:
+    """下发选规的硬闸（在下发写事务内调用，读规+验戳+落票同票）。
+
+    通过则返回盖章后的现行戳；任一不成立抛 世代戳拒绝（调用方翻 409）：
+      1. 本键必须有现行戳——无戳不放行（禁止无戳点规，归档规更不可能被点中）；
+      2. 桶必须是生效态且属当前戳内生效集——戳外/归档规拒绝；
+      3. 库内生效集重算哈希必须等于戳面哈希——错戳/半截失败不放行；
+      4. 戳只按本开关键读，邻键戳不参与——禁止邻开关键戳串用。
+    """
+    戳 = 取现行戳(conn, 开关键)
+    if not 戳:
+        raise 世代戳拒绝(f"开关键 {开关键} 无分桶世代戳，禁止无戳选规下发")
+    bucket = conn.execute(
+        "SELECT * FROM 分桶规 WHERE 桶键=? AND 开关键=?", (桶键, 开关键)
+    ).fetchone()
+    if not bucket:
+        raise 世代戳拒绝(f"分桶不存在或不属本开关键（戳不串键）:{桶键}@{开关键}")
+    if bucket["状态"] != "生效":
+        raise 世代戳拒绝(
+            f"戳外规不可下发：桶 {桶键} 状态={bucket['状态']}"
+            f"（归档因={bucket['归档因'] or '—'}），现行戳只认生效集"
+        )
+    当下 = 生效集快照(conn, 开关键)
+    当下哈希 = 集合哈希(当下)
+    if 当下哈希 != 戳["集合哈希"]:
+        raise 世代戳拒绝(
+            f"错戳：开关键 {开关键} 现行生效集哈希 {当下哈希[:12]} ≠ "
+            f"戳面哈希 {戳['集合哈希'][:12]}（疑似半截失败/库集被拧），失败闭"
+        )
+    戳内桶 = set(json.loads(戳["生效集合"] or "[]"))
+    if 桶键 not in 戳内桶:
+        raise 世代戳拒绝(
+            f"桶 {桶键} 不属开关键 {开关键} 戳内生效集 {sorted(戳内桶)}，禁止绑戳外规"
+        )
+    return 戳
 
 
-def 登记证明(conn, **kwargs) -> str:
-    return ""
+def 票绑旧集(conn, 票) -> bool:
+    """已下发票是否绑了旧集合（热更新后其桶已不在当前戳内生效集，或戳已升号）。"""
+    票 = dict(票)
+    戳 = 取现行戳(conn, 票["开关键"])
+    if not 戳:
+        return True
+    if int(票.get("戳世代号") or 0) != int(戳["世代号"]):
+        return True
+    bucket = conn.execute(
+        "SELECT 状态 FROM 分桶规 WHERE 桶键=?", (票["桶键"],)
+    ).fetchone()
+    return (not bucket) or bucket["状态"] != "生效"
+
+
+def 核证(conn, 开关键: str | None = None) -> dict:
+    """只读核证：世代号、生效集合、工单有无、valid；附归档集与绑旧集的票。"""
+    if 开关键:
+        键们 = [开关键]
+    else:
+        键们 = [
+            r["开关键"]
+            for r in conn.execute(
+                "SELECT DISTINCT 开关键 FROM 分桶规 WHERE 开关键<>'' ORDER BY 开关键"
+            )
+        ]
+    逐键 = []
+    全局违规 = []
+    for k in 键们:
+        违规 = []
+        戳 = 取现行戳(conn, k)
+        生效集 = 生效集快照(conn, k)
+        归档集 = 归档集快照(conn, k)
+        当下哈希 = 集合哈希(生效集)
+        生效桶 = [r["桶键"] for r in 生效集]
+
+        if not 戳:
+            # 有规无戳即违反硬约束（规生效成功而世代戳空）
+            if 生效桶 or 归档集:
+                违规.append(f"规已落库但无世代戳:{k}")
+            逐键.append({
+                "开关键": k, "世代号": 0, "生效集合": 生效桶,
+                "归档集合": [r["桶键"] for r in 归档集],
+                "生效规": 生效集, "归档规": 归档集,
+                "集合哈希": "", "戳时": "", "工单有无": False, "工单": "",
+                "口径": 口径, "valid": not 违规, "违规": 违规,
+                "绑旧集票据": [], "历史": [],
+            })
+            全局违规 += 违规
+            continue
+
+        戳内桶 = json.loads(戳["生效集合"] or "[]")
+        if 戳["集合哈希"] != 当下哈希:
+            违规.append(f"错戳：戳面哈希与现行生效集不符:{k}")
+        if sorted(戳内桶) != sorted(生效桶):
+            违规.append(f"戳面生效集合与库不符:{k}（戳={戳内桶} 库={生效桶}）")
+        if (戳.get("工单") or ""):
+            违规.append(f"甲口径无工单实体，戳面不得带工单:{k}")
+
+        # 单调性：历史世代号必须严格递增且无重号
+        历史 = [dict(r) for r in conn.execute(
+            f"SELECT 开关键, 世代号, 生效集合, 集合哈希, 戳时, 工单, 变更, 时刻 "
+            f"FROM {表名} WHERE 开关键=? ORDER BY 世代号", (k,))]
+        号列 = [int(r["世代号"]) for r in 历史]
+        if 号列 != sorted(set(号列)) or 号列 != list(range(1, len(号列) + 1)):
+            违规.append(f"世代号不单调/不连续:{k}:{号列}")
+
+        # 已下发不得绑旧集合：逐票核对当前戳
+        绑旧 = []
+        for t in conn.execute(
+            "SELECT 票号, 桶键, 状态, 戳世代号, 戳集合哈希, 下发时 FROM 下发票 "
+            "WHERE 开关键=? ORDER BY 下发时", (k,),
+        ):
+            d = dict(t)
+            if d["状态"] == "已下发" and (
+                int(d.get("戳世代号") or 0) != int(戳["世代号"])
+                or d["桶键"] not in 生效桶
+            ):
+                d["需复核"] = "票据绑旧集合（现行戳已升号/桶已归档）"
+                绑旧.append(d)
+        if 绑旧:
+            违规.append(f"已下发票绑定旧集合:{k}:{[d['票号'] for d in 绑旧]}")
+
+        全局违规 += 违规
+        逐键.append({
+            "开关键": k,
+            "世代号": int(戳["世代号"]),
+            "生效集合": 生效桶,
+            "归档集合": [r["桶键"] for r in 归档集],
+            "生效规": 生效集,
+            "归档规": 归档集,
+            "集合哈希": 戳["集合哈希"],
+            "现行哈希": 当下哈希,
+            "戳时": 戳["戳时"],
+            "工单有无": bool((戳.get("工单") or "").strip()),
+            "工单": 戳.get("工单") or "",
+            "口径": 口径,
+            "valid": not 违规,
+            "违规": 违规,
+            "绑旧集票据": 绑旧,
+            "历史": 历史,
+        })
+
+    return {
+        "口径": 口径,
+        "口径说明": 口径说明,
+        "范围": 开关键 or "*",
+        "valid": not 全局违规,
+        "违规": 全局违规,
+        "开关键们": 逐键,
+    }
 
 
 def 巡检包(payload: dict | None = None) -> dict:
-    base = {
+    return {
         "kind": "bucket-gen",
         "nn": "18",
-        "linked": False,
-        "enforce": False,
-        "matrix": [i * i for i in range(12)],
-        "slots": [f"s-{i}" for i in range(16)],
-    }
-    if payload:
-        base.update(payload)
-    return base
-
-
-def 现场摘要() -> dict:
-    return {
-        "nn": "18",
-        "mod": "分桶世代戳",
-        "table": "分桶世代戳表",
-        "checklist": list(range(24)),
-        "vectors": [{"k": i, "v": i * 3} for i in range(18)],
+        "口径": 口径,
+        "linked": True,
+        "enforce": True,
     }

@@ -1,11 +1,10 @@
 from app.db import 连接
 from app.seed import 此刻
 from app.modules.名单百分比互斥 import 核证
+from app.modules.分桶世代戳 import 核证 as 戳核证
 
 
 def 跑贯验() -> dict:
-    from app.modules import 分桶世代戳 as _bf_18
-    _ = _bf_18.选规放行(None, "")
     conn = 连接()
     try:
         版本数 = conn.execute("SELECT COUNT(*) FROM 开关版本").fetchone()[0]
@@ -44,6 +43,11 @@ def 跑贯验() -> dict:
         ):
             问题.append(f"下发落在归档规:{r['票号']}@{r['桶键']}")
 
+        # 世代戳贯验：有规必有戳、戳哈希合现行集、票绑当前戳、世代号单调
+        戳报 = 戳核证(conn)
+        for v in 戳报["违规"]:
+            问题.append(f"世代戳:{v}")
+
         通过 = 1 if not 问题 else 0
         说明 = "齐" if 通过 else "; ".join(问题)
         conn.execute(
@@ -62,10 +66,3 @@ def 跑贯验() -> dict:
         }
     finally:
         conn.close()
-
-
-def _bf_touch_18(conn=None, 键: str = ""):
-    from app.modules import 分桶世代戳 as _m
-    _ = _m.选规放行(conn, 键)
-    _ = _m.登记证明(conn)
-    return _m.巡检包({ "touched": True })

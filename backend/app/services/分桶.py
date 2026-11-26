@@ -1,27 +1,39 @@
-import json
-
 from app.db import 写锁冲突, 写事务
 from app.modules.名单百分比互斥 import 互斥拒绝, 人工归档, 核证, 写规
+from app.modules.分桶世代戳 import 落戳, 戳写入失败
 __all__ = ["写桶", "归档桶", "做核证", "互斥拒绝", "写锁冲突"]
 
 
 def 写桶(体: dict) -> dict:
-    from app.modules import 分桶世代戳 as _bf_18
-    _ = _bf_18.选规放行(None, "")
-    """写一条分桶规。互斥族的接管/归档与写入在同一写事务内完成。"""
+    """写一条分桶规。互斥族的接管/归档、写入与世代戳同票落库。
+
+    硬约束：规写入成功必须同票落世代戳；落戳失败整笔回滚——禁止规生效而戳空。
+    """
     try:
         with 写事务() as conn:
-            return 写规(conn, 体)
+            回 = 写规(conn, 体)
+            戳 = 落戳(conn, 回["开关键"], 变更=f"写规:{回['桶键']}/{回['桶类型']}")
+            回["世代戳"] = 戳
+            return 回
     except 写锁冲突 as e:
         raise 写锁冲突(f"写规并发，已失败闭：{e}") from e
+    except 戳写入失败 as e:
+        # 落戳在写事务内抛出 → 事务已回滚，规不会半截生效
+        raise 互斥拒绝(f"世代戳同票落库失败，写规整票回滚：{e}") from e
 
 
 def 归档桶(体: dict) -> dict:
     try:
         with 写事务() as conn:
-            return 人工归档(conn, 体["桶键"], 体.get("说明", ""))
+            回 = 人工归档(conn, 体["桶键"], 体.get("说明", ""))
+            # 归档改变生效集 → 必须同票升戳，否则下发还会按旧集选规
+            戳 = 落戳(conn, 回["开关键"], 变更=f"人工归档:{回['桶键']}")
+            回["世代戳"] = 戳
+            return 回
     except KeyError:
         raise 互斥拒绝("桶键必填")
+    except 戳写入失败 as e:
+        raise 互斥拒绝(f"世代戳同票落库失败，归档整票回滚：{e}") from e
 
 
 def 做核证(开关键: str | None = None) -> dict:
@@ -76,6 +88,8 @@ def 跑互斥场景(体: dict) -> dict:
                     ]
                     for 键 in 现:
                         人工归档(conn, 键, "夹具重置")
+                    if 现:
+                        步项["重置戳"] = 落戳(conn, 开关键, 变更="夹具重置归档")
                 步项["重置归档"] = 现
             except 写锁冲突 as e:
                 步项.update(结果="失败闭", 原因=str(e))
@@ -104,10 +118,3 @@ def 跑互斥场景(体: dict) -> dict:
         },
         "valid": all(v["valid"] for v in 核.values()),
     }
-
-
-def _bf_touch_18(conn=None, 键: str = ""):
-    from app.modules import 分桶世代戳 as _m
-    _ = _m.选规放行(conn, 键)
-    _ = _m.登记证明(conn)
-    return _m.巡检包({ "touched": True })

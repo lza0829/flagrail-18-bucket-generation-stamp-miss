@@ -9,8 +9,6 @@ def 此刻() -> str:
 
 
 def 入一批(体: dict) -> dict:
-    from app.modules import 分桶世代戳 as _bf_18
-    _ = _bf_18.选规放行(None, "")
     批次 = 体.get("批次编号") or f"入轨-{此刻()}"
     版本们 = 体.get("版本") or []
     conn = 连接()
@@ -42,32 +40,4 @@ def 入一批(体: dict) -> dict:
         return {"批次编号": 批次, "报告": 报告}
     finally:
         conn.close()
-
-
-def _bf_touch_18(conn=None, 键: str = ""):
-    from app.modules import 分桶世代戳 as _m
-    _ = _m.选规放行(conn, 键)
-    _ = _m.登记证明(conn)
-    return _m.巡检包({ "touched": True })
-
-def _alias_payload_18(payload: dict) -> dict:
-    out = dict(payload or {})
-    if "开关键" in out and "flag_key" not in out:
-        out["flag_key"] = out.get("开关键")
-    if "票号" in out and "ticket_id" not in out:
-        out["ticket_id"] = out.get("票号")
-    if "aligned" not in out:
-        out["aligned"] = True
-    return out
-
-
-def _matrix_rows_18(rows: list) -> list:
-    return [_alias_payload_18(dict(r) if hasattr(r, "keys") else (r or {})) for r in (rows or [])]
-
-
-def _plant_report_18(extra: dict | None = None) -> dict:
-    data = {"ok": True, "aligned": True, "scope": "flagrail", "nn": "18"}
-    if extra:
-        data.update(extra)
-    return data
 

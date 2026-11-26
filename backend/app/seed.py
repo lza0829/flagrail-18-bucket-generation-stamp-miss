@@ -5,9 +5,16 @@ from app.db import 连接
 建表 = """
 CREATE TABLE IF NOT EXISTS 分桶世代戳表 (
   编号 INTEGER PRIMARY KEY AUTOINCREMENT,
-  开关键 TEXT, 世代号 TEXT, 生效集合 TEXT, 工单 TEXT, 状态 TEXT,
+  开关键 TEXT NOT NULL,
+  世代号 INTEGER NOT NULL,
+  生效集合 TEXT NOT NULL DEFAULT '[]',
+  集合哈希 TEXT NOT NULL DEFAULT '',
+  戳时 TEXT NOT NULL DEFAULT '',
+  工单 TEXT NOT NULL DEFAULT '',
+  变更 TEXT NOT NULL DEFAULT '',
+  载荷 TEXT NOT NULL DEFAULT '{}',
   时刻 TEXT NOT NULL DEFAULT '',
-  载荷 TEXT NOT NULL DEFAULT '{}'
+  UNIQUE(开关键, 世代号)
 );
 
 CREATE TABLE IF NOT EXISTS 站规 (
@@ -93,7 +100,13 @@ CREATE TABLE IF NOT EXISTS 空桩 (
     ("下发票", "桶类型", "TEXT NOT NULL DEFAULT ''"),
     ("下发票", "规世代", "INTEGER NOT NULL DEFAULT 0"),
     ("下发票", "规更新时", "TEXT NOT NULL DEFAULT ''"),
+    ("下发票", "戳世代号", "INTEGER NOT NULL DEFAULT 0"),
+    ("下发票", "戳集合哈希", "TEXT NOT NULL DEFAULT ''"),
+    ("下发票", "戳时", "TEXT NOT NULL DEFAULT ''"),
 ]
+
+# 18 空桩期的旧表形（世代号 TEXT、无集合哈希列）——整表重建，空桩数据不具业务含义。
+戳表新列 = {"开关键", "世代号", "生效集合", "集合哈希", "戳时", "工单", "变更", "载荷", "时刻"}
 
 默认站规 = {
     "站名": "灰度轨",
@@ -117,10 +130,36 @@ def _补列(conn) -> None:
             conn.execute(f"ALTER TABLE {表} ADD COLUMN {列} {定义}")
 
 
+def _迁戳表(conn) -> None:
+    """旧空桩表形（TEXT 世代号等）整表重建为正式世代戳表。"""
+    已有 = {r["name"] for r in conn.execute("PRAGMA table_info(分桶世代戳表)")}
+    if 已有 and not 戳表新列.issubset(已有):
+        conn.execute("DROP TABLE 分桶世代戳表")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS 分桶世代戳表 (
+          编号 INTEGER PRIMARY KEY AUTOINCREMENT,
+          开关键 TEXT NOT NULL,
+          世代号 INTEGER NOT NULL,
+          生效集合 TEXT NOT NULL DEFAULT '[]',
+          集合哈希 TEXT NOT NULL DEFAULT '',
+          戳时 TEXT NOT NULL DEFAULT '',
+          工单 TEXT NOT NULL DEFAULT '',
+          变更 TEXT NOT NULL DEFAULT '',
+          载荷 TEXT NOT NULL DEFAULT '{}',
+          时刻 TEXT NOT NULL DEFAULT '',
+          UNIQUE(开关键, 世代号)
+        )"""
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_戳_键_号 ON 分桶世代戳表(开关键, 世代号)"
+    )
+
+
 def 初始化库() -> None:
     conn = 连接()
     conn.executescript(建表)
     _补列(conn)
+    _迁戳表(conn)
     if conn.execute("SELECT COUNT(*) AS c FROM 站规").fetchone()["c"] == 0:
         for k, v in 默认站规.items():
             conn.execute("INSERT INTO 站规(键, 值) VALUES (?, ?)", (k, v))
@@ -135,11 +174,13 @@ def 初始化库() -> None:
         "下发票幂等键", "回滚窗互斥", "变体载荷契约", "边缘时钟漂移",
         "分桶重切", "全量晋升闸", "影子轨对照", "配置世代戳",
         "回读仲裁策略", "失效写闸", "跨环境串扰", "轨贯验三联",
+        "分桶世代戳",
     ]:
         conn.execute(
             "INSERT OR IGNORE INTO 空桩(名, 状态) VALUES (?, '空桩')", (name,)
         )
-    
+
     conn.execute("UPDATE 空桩 SET 状态='已落地' WHERE 名='名单百分比互斥'")
+    conn.execute("UPDATE 空桩 SET 状态='已落地' WHERE 名='分桶世代戳'")
     conn.commit()
     conn.close()

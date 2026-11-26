@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from app.db import 夹具目录, 连接
 from app.services import 入轨, 分桶, 下发, 回读, 命运, 贯验, 目录
+from app.modules import 分桶世代戳 as 世代戳
 
 路由 = APIRouter(prefix="/api")
 
@@ -271,40 +272,47 @@ def 列贯验():
     finally:
         conn.close()
 
-from app.modules import 分桶世代戳 as _bf_mod_18
-
 
 @路由.get("/核证/分桶世代")
 def 取核证_18(键: str | None = None):
+    """分桶世代戳只读核证：世代号、生效集合、工单有无、valid（含归档集/绑旧集票/历史）。"""
     conn = 连接()
     try:
-        return _bf_mod_18.查现场(conn, 键)
+        return 世代戳.核证(conn, 键)
+    finally:
+        conn.close()
+
+
+@路由.get("/核证/分桶世代/历史")
+def 戳历史_18(键: str, 限: int = 50):
+    """分桶规页翻世代号：按开关键取世代戳历史（旧→新），每票带生效集与归档集。"""
+    限 = max(1, min(int(限), 200))
+    conn = 连接()
+    try:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT 开关键, 世代号, 生效集合, 集合哈希, 戳时, 工单, 变更, 时刻, 载荷 "
+                "FROM 分桶世代戳表 WHERE 开关键=? ORDER BY 世代号 DESC LIMIT ?",
+                (键, 限),
+            )
+        ]
+        for r in rows:
+            try:
+                r["生效集合"] = json.loads(r["生效集合"])
+            except Exception:
+                pass
+            try:
+                r["载荷"] = json.loads(r["载荷"])
+            except Exception:
+                pass
+            r["工单有无"] = bool((r.get("工单") or "").strip())
+        return {"开关键": 键, "口径": 世代戳.口径, "历史": rows}
     finally:
         conn.close()
 
 
 @路由.post("/核证/分桶世代/巡检")
 def 巡检核证_18(payload: dict | None = None):
-    return _bf_mod_18.巡检包(payload or {})
-
-def _alias_payload_18(payload: dict) -> dict:
-    out = dict(payload or {})
-    if "开关键" in out and "flag_key" not in out:
-        out["flag_key"] = out.get("开关键")
-    if "票号" in out and "ticket_id" not in out:
-        out["ticket_id"] = out.get("票号")
-    if "aligned" not in out:
-        out["aligned"] = True
-    return out
-
-
-def _matrix_rows_18(rows: list) -> list:
-    return [_alias_payload_18(dict(r) if hasattr(r, "keys") else (r or {})) for r in (rows or [])]
-
-
-def _plant_report_18(extra: dict | None = None) -> dict:
-    data = {"ok": True, "aligned": True, "scope": "flagrail", "nn": "18"}
-    if extra:
-        data.update(extra)
-    return data
+    return 世代戳.巡检包(payload or {})
 
